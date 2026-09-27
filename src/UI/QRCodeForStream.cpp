@@ -6,6 +6,13 @@
 #include "QRScanner.h"
 #include "MhyApi.hpp"
 
+namespace
+{
+// 直播流延迟的上限，仅用于兜底，避免误填超大值把内存吃光。
+// 队列占用约为「码率 × 延迟」，例如 8Mbps × 60s ≈ 60MB。
+constexpr int64_t MAX_STREAM_DELAY_MS{ 60000 };
+}
+
 QRCodeForStream::QRCodeForStream(QObject* parent) :
     QThread(parent),
     pAvdictionary(nullptr),
@@ -59,23 +66,15 @@ void QRCodeForStream::setServerType(const ServerType servertype)
 
 void QRCodeForStream::LoginOfficial()
 {
-    while (m_stop.load())
+    // 把「取帧 -> 转 BGR -> 交给线程池识别」原样装进 lambda，
+    // 让延迟路径与直通路径共用同一份逻辑，识别部分一个字未改。
+    const auto processDecoded = [&]() -> bool
     {
-        if (av_read_frame(pAVFormatContext, pAVPacket) < 0)
-        {
-            ret = ScanRet::LIVESTOP;
-            break;
-        }
-        if (pAVPacket->stream_index != videoStreamIndex)
-        {
-            continue;
-        }
-        avcodec_send_packet(pAVCodecContext, pAVPacket);
         if (pAVFrame == nullptr)
         {
             std::cerr << "Error allocating frame" << std::endl;
             ret = ScanRet::LIVESTOP;
-            break;
+            return false;
         }
         while (avcodec_receive_frame(pAVCodecContext, pAVFrame) == 0)
         {
@@ -133,12 +132,9 @@ void QRCodeForStream::LoginOfficial()
             });
         }
         av_frame_unref(pAVFrame);
-        av_packet_unref(pAVPacket);
-    }
-}
+        return true;
+    };
 
-void QRCodeForStream::LoginBH3BiliBili()
-{
     while (m_stop.load())
     {
         if (av_read_frame(pAVFormatContext, pAVPacket) < 0)
@@ -150,12 +146,52 @@ void QRCodeForStream::LoginBH3BiliBili()
         {
             continue;
         }
-        avcodec_send_packet(pAVCodecContext, pAVPacket);
+        if (m_delayMs > 0)
+        {
+            // 延迟路径：先入队，再只放行「时间戳已落后 delayMs」的包。
+            // 读循环保持全速，TCP 不回压，因此延迟精确且有界。
+            enqueueDelayed(pAVPacket);
+            bool ok = true;
+            while (!m_packetQueue.empty() && headPacketDue())
+            {
+                AVPacket* pkt = m_packetQueue.front().pkt;
+                m_packetQueue.pop_front();
+                avcodec_send_packet(pAVCodecContext, pkt);
+                av_packet_free(&pkt);
+                if (!processDecoded())
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok)
+            {
+                break;
+            }
+        }
+        else
+        {
+            // 未设置延迟：与改动前完全一致的直通路径。
+            avcodec_send_packet(pAVCodecContext, pAVPacket);
+            if (!processDecoded())
+            {
+                break;
+            }
+        }
+        av_packet_unref(pAVPacket);
+    }
+}
+
+void QRCodeForStream::LoginBH3BiliBili()
+{
+    // 同 LoginOfficial：识别部分原样装进 lambda，两条路径共用。
+    const auto processDecoded = [&]() -> bool
+    {
         if (pAVFrame == nullptr)
         {
             std::cerr << "Error allocating frame" << std::endl;
             ret = ScanRet::LIVESTOP;
-            break;
+            return false;
         }
 
         while (avcodec_receive_frame(pAVCodecContext, pAVFrame) == 0)
@@ -212,6 +248,49 @@ void QRCodeForStream::LoginBH3BiliBili()
             });
         }
         av_frame_unref(pAVFrame);
+        return true;
+    };
+
+    while (m_stop.load())
+    {
+        if (av_read_frame(pAVFormatContext, pAVPacket) < 0)
+        {
+            ret = ScanRet::LIVESTOP;
+            break;
+        }
+        if (pAVPacket->stream_index != videoStreamIndex)
+        {
+            continue;
+        }
+        if (m_delayMs > 0)
+        {
+            enqueueDelayed(pAVPacket);
+            bool ok = true;
+            while (!m_packetQueue.empty() && headPacketDue())
+            {
+                AVPacket* pkt = m_packetQueue.front().pkt;
+                m_packetQueue.pop_front();
+                avcodec_send_packet(pAVCodecContext, pkt);
+                av_packet_free(&pkt);
+                if (!processDecoded())
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok)
+            {
+                break;
+            }
+        }
+        else
+        {
+            avcodec_send_packet(pAVCodecContext, pAVPacket);
+            if (!processDecoded())
+            {
+                break;
+            }
+        }
         av_packet_unref(pAVPacket);
     }
 }
@@ -235,6 +314,77 @@ void QRCodeForStream::setStreamHW()
 void QRCodeForStream::stop()
 {
     m_stop.store(false);
+}
+
+void QRCodeForStream::loadStreamDelay()
+{
+    m_delayMs = 0;
+    m_latestPts = AV_NOPTS_VALUE;
+    try
+    {
+        const nlohmann::json config = nlohmann::json::parse(m_config->getConfig());
+        // 用 value() 而不是 []：旧配置文件里没有这个字段时取默认值 0，
+        // 此时走直通路径，行为与未加延迟时完全一致。
+        int64_t delay = config.value("stream_delay_ms", 0);
+        if (delay < 0)
+        {
+            delay = 0;
+        }
+        else if (delay > MAX_STREAM_DELAY_MS)
+        {
+            delay = MAX_STREAM_DELAY_MS;
+        }
+        m_delayMs = delay;
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "stream_delay_ms 解析失败，按 0 处理: " << e.what() << std::endl;
+        m_delayMs = 0;
+    }
+    if (m_delayMs > 0)
+    {
+        std::cout << "直播流延迟已启用: " << m_delayMs << " ms" << std::endl;
+    }
+}
+
+void QRCodeForStream::enqueueDelayed(const AVPacket* pkt)
+{
+    AVPacket* copy = av_packet_clone(pkt);
+    if (copy == nullptr)
+    {
+        return;
+    }
+    // 归一化成毫秒。FLV 的 time_base 本就是 1/1000，这里写成通用换算以兼容其他封装。
+    const AVStream* stream = pAVFormatContext->streams[videoStreamIndex];
+    const int64_t raw = (copy->pts != AV_NOPTS_VALUE) ? copy->pts : copy->dts;
+    int64_t ptsMs = -1;
+    if (raw != AV_NOPTS_VALUE)
+    {
+        ptsMs = av_rescale_q(raw, stream->time_base, AVRational{ 1, 1000 });
+        if (m_latestPts == AV_NOPTS_VALUE || ptsMs > m_latestPts)
+        {
+            m_latestPts = ptsMs;
+        }
+    }
+    m_packetQueue.push_back(DelayedPacket{ copy, ptsMs });
+}
+
+bool QRCodeForStream::headPacketDue() const
+{
+    // m_latestPts 是已入队的最新时间戳，压住它前面 delayMs 这段不放行。
+    // 时间戳缺失（极少见）时不拦截，否则闸门永远打不开。
+    const int64_t ptsMs = m_packetQueue.front().ptsMs;
+    return ptsMs < 0 || m_latestPts == AV_NOPTS_VALUE || ptsMs <= m_latestPts - m_delayMs;
+}
+
+void QRCodeForStream::clearDelayedPackets()
+{
+    for (auto& item : m_packetQueue)
+    {
+        av_packet_free(&item.pkt);
+    }
+    m_packetQueue.clear();
+    m_latestPts = AV_NOPTS_VALUE;
 }
 
 void QRCodeForStream::setUrl(const std::string& url, const std::map<std::string, std::string> heard)
@@ -338,6 +488,8 @@ void QRCodeForStream::run()
     threadPool.setMaxThreadCount(threadNumber);
     m_stop.store(true);
     ret = ScanRet::UNKNOW;
+    clearDelayedPackets();
+    loadStreamDelay();
     //TODO 获取直播流地址放在这里
     if (init())
     {
@@ -369,6 +521,7 @@ void QRCodeForStream::run()
 #ifndef SHOW
     cv::destroyWindow("Video_Stream");
 #endif
+    clearDelayedPackets();
     avformat_close_input(&pAVFormatContext);
     avcodec_free_context(&pAVCodecContext);
     sws_freeContext(pSwsContext);

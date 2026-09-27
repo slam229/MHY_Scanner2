@@ -1,6 +1,8 @@
 ﻿#pragma once
 
 #include <atomic>
+#include <cstdint>
+#include <deque>
 #include <string_view>
 
 extern "C"
@@ -8,6 +10,7 @@ extern "C"
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/time.h>
 #include <libswscale/swscale.h>
 };
@@ -51,6 +54,24 @@ private:
     void LoginOfficial();
     void LoginBH3BiliBili();
     void setStreamHW();
+
+    // ---- 直播流延迟（新增，见 README「直播流延迟」）----
+    // 已编码包 + 其归一到毫秒的时间戳。缓存编码包而不是解码后的帧：
+    // 1080p 一帧 BGR 约 6MB，缓冲 10 秒就要 1.8GB，而编码包只要几 MB。
+    struct DelayedPacket
+    {
+        AVPacket* pkt;
+        int64_t ptsMs;
+    };
+    void loadStreamDelay();
+    void enqueueDelayed(const AVPacket* pkt);
+    bool headPacketDue() const;
+    void clearDelayedPackets();
+    std::deque<DelayedPacket> m_packetQueue;
+    int64_t m_delayMs{ 0 };
+    int64_t m_latestPts{ AV_NOPTS_VALUE };
+    // ---- 直播流延迟 结束 ----
+
     std::string streamUrl{};
     std::string m_name;
     ConfigDate* m_config;
