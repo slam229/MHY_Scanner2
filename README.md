@@ -1,5 +1,7 @@
 # MHY_Scanner2
 
+由ai修改，此文档大部分复制原项目，增添通过调整Config设置delay的功能.
+
 MHY_Scanner2 是基于 [DSVVA/MHY_Scanner](https://github.com/DSVVA/MHY_Scanner) 二次修改的米哈游扫码工具。
 
 本项目为免费开源项目，仅用于学习和研究，禁止商业化用途。请勿提交或公开自己的 Cookie、SToken、MID、UID 等账号敏感信息。
